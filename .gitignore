@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+*.pyo
+
+*.bak
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# agent 运行时缓存
+/tmp/agent_cache/
