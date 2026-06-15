@@ -153,6 +153,67 @@ class ParseSSETest(unittest.TestCase):
         self.assertEqual(result.message.content, "ab")
 
 
+class CrossEndpointTest(unittest.TestCase):
+    """不同 OpenAI 兼容端点的 SSE 方言：OpenAI / vLLM / 代理注入等。"""
+
+    def setUp(self):
+        self.m = Model()
+
+    def _parse(self, chunks):
+        return self.m._parse_sse(iter(chunks))
+
+    def test_openai_style_no_reasoning(self):
+        # 标准 OpenAI：无 reasoning_content，带 [DONE]
+        chunks = [content_event("Hello"), content_event(" GPT"), b"data: [DONE]\n\n"]
+        res = self._parse(chunks)
+        self.assertEqual(res.message.content, "Hello GPT")
+        self.assertIsNone(res.message.reasoning_content)
+
+    def test_vllm_no_done_sentinel(self):
+        # 部分 vLLM 部署流结束不发 [DONE]，靠迭代器耗尽收尾
+        chunks = [content_event("from"), content_event(" vllm")]
+        res = self._parse(chunks)
+        self.assertEqual(res.message.content, "from vllm")
+
+    def test_usage_only_final_chunk(self):
+        # OpenAI stream_options.include_usage：最后一块 choices=[]，仅含 usage
+        chunks = [content_event("hi"),
+                  sse({"choices": [], "usage": {"total_tokens": 5}}),
+                  b"data: [DONE]\n\n"]
+        res = self._parse(chunks)
+        self.assertEqual(res.message.content, "hi")
+
+    def test_data_without_space(self):
+        # 有的端点输出 data:{...} 不带空格
+        line = b"data:" + json.dumps(
+            {"choices": [{"delta": {"content": "x"}}]}).encode() + b"\n\n"
+        res = self._parse([line, b"data:[DONE]\n\n"])
+        self.assertEqual(res.message.content, "x")
+
+    def test_tool_call_without_index(self):
+        # 个别端点单工具调用不带 index 字段
+        ev = sse({"choices": [{"delta": {"tool_calls": [
+            {"id": "c0", "function": {"name": "ls", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]})
+        res = self._parse([ev, b"data: [DONE]\n\n"])
+        self.assertEqual(len(res.message.tool_calls), 1)
+        self.assertEqual(res.message.tool_calls[0].function.name, "ls")
+
+    def test_keepalive_and_malformed_lines_skipped(self):
+        # SSE 注释行(:)、空行、坏 JSON 都跳过，不中断流
+        chunks = [b": keepalive\n\n", b"\n",
+                  b"data: not-json-garbage\n\n",
+                  content_event("ok"), b"data: [DONE]\n\n"]
+        res = self._parse(chunks)
+        self.assertEqual(res.message.content, "ok")
+
+    def test_mid_stream_error_raises(self):
+        chunks = [content_event("partial"),
+                  sse({"error": {"message": "rate limited", "code": 429}})]
+        with self.assertRaises(RuntimeError):
+            self._parse(chunks)
+
+
 class FakeResp:
     """模拟 urlopen 返回的响应对象，支持 read(n) 和上下文管理。"""
     def __init__(self, data):

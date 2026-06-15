@@ -546,9 +546,19 @@ class Model:
                     done = True
                     break
 
-                choices = json.loads(data).get("choices") or [{}]
+                # 不同端点（OpenAI / vLLM / 各代理）可能注入非 JSON 的保活/注释行，
+                # 单行解析失败只跳过该行，不中断整个流。
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                # 部分端点会在流中以 {"error": {...}} 形式回传错误
+                if isinstance(obj, dict) and obj.get("error"):
+                    raise RuntimeError(f"stream error: {obj['error']}")
+
+                choices = obj.get("choices") or [{}]
                 ch = choices[0]
-                delta = ch.get("delta", {})
+                delta = ch.get("delta") or {}
 
                 rtok = delta.get("reasoning_content") or ""
                 if rtok:
@@ -562,9 +572,9 @@ class Model:
                     if on_token:
                         on_token(tok, "content")
 
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc["index"]
-                    fn = tc.get("function", {})
+                for i, tc in enumerate(delta.get("tool_calls") or []):
+                    idx = tc.get("index", i)   # 个别端点不带 index，用出现顺序兜底
+                    fn = tc.get("function") or {}
                     if idx not in tc_map:
                         tc_map[idx] = {"id": tc.get("id", ""),
                                        "name": fn.get("name", ""), "arguments": ""}
