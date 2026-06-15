@@ -1,6 +1,8 @@
 .env
 .env.*
-!.env.example
+
+# 本地单测，不纳入仓库
+test_stream.py
 
 __pycache__/
 *.pyc
