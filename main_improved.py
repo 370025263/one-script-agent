@@ -504,23 +504,36 @@ class Model:
             headers={"Authorization": f"Bearer {self.api_key}",
                      "Content-Type": "application/json"},
         )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            byte_iter = iter(lambda: resp.read(4096), b"")
+            return self._parse_sse(byte_iter, on_token)
+
+    def _parse_sse(self, byte_iter, on_token=None):
+        """从字节块迭代器解析 SSE，返回 OpenAI choice 风格对象。
+
+        手动按 \\n 缓冲分行：HTTP chunk 边界可能切在多字节 UTF-8 序列中间，
+        逐行 readline 会拿到截断字节导致中文乱码，缓冲到完整行再 decode。
+        """
         content_parts: list[str] = []
         tc_map: dict[int, dict] = {}   # index → {id, name, arguments}
         finish_reason = None
+        buf = b""
+        done = False
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            buf = b""
-            for chunk in iter(lambda: resp.read(4096), b""):
-                buf += chunk
-                while b"\n" in buf:
-                    raw, buf = buf.split(b"\n", 1)
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r")
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].lstrip()
+        for chunk in byte_iter:
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].lstrip()
                 if data == "[DONE]":
+                    done = True
                     break
-                ch = json.loads(data)["choices"][0]
+
+                choices = json.loads(data).get("choices") or [{}]
+                ch = choices[0]
                 delta = ch.get("delta", {})
 
                 tok = delta.get("content") or ""
@@ -540,10 +553,12 @@ class Model:
                             tc_map[idx]["id"] = tc["id"]
                         if fn.get("name"):
                             tc_map[idx]["name"] = fn["name"]
-                    tc_map[idx]["arguments"] += fn.get("arguments", "")
+                    tc_map[idx]["arguments"] += fn.get("arguments") or ""
 
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
+            if done:
+                break
 
         tool_calls = None
         if tc_map:
