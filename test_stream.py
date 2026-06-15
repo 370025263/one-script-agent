@@ -23,6 +23,11 @@ def content_event(text):
     return sse({"choices": [{"delta": {"content": text}, "finish_reason": None}]})
 
 
+def reasoning_event(text):
+    return sse({"choices": [{"delta": {"content": None, "reasoning_content": text},
+                             "finish_reason": None}]})
+
+
 def chunk_bytes(payload: bytes, size: int):
     """把一段完整字节流按 size 切成块——模拟 HTTP chunk 任意边界。"""
     return [payload[i:i + size] for i in range(0, len(payload), size)]
@@ -33,8 +38,10 @@ class ParseSSETest(unittest.TestCase):
         self.m = Model()
 
     def _parse(self, byte_chunks, capture_tokens=False):
+        # 只收集正文 token，保持原有断言不变
         tokens = []
-        cb = tokens.append if capture_tokens else None
+        cb = (lambda t, kind: tokens.append(t) if kind == "content" else None) \
+            if capture_tokens else None
         result = self.m._parse_sse(iter(byte_chunks), on_token=cb)
         return result, tokens
 
@@ -68,6 +75,31 @@ class ParseSSETest(unittest.TestCase):
             with self.subTest(chunk_size=size):
                 result, _ = self._parse(chunk_bytes(payload, size))
                 self.assertEqual(result.message.content, "ok👍🚀done")
+
+    def test_reasoning_model_separates_content(self):
+        # deepseek-v4-flash 推理模型：reasoning_content 是思维链，content 才是答案
+        chunks = [
+            reasoning_event("让我想想"), reasoning_event("用户要打招呼"),
+            content_event("你好"),
+            b"data: [DONE]\n\n",
+        ]
+        kinds = []
+        result = self.m._parse_sse(iter(chunks), on_token=lambda t, k: kinds.append((k, t)))
+        # 正文只含答案，不含思维链
+        self.assertEqual(result.message.content, "你好")
+        self.assertEqual(result.message.reasoning_content, "让我想想用户要打招呼")
+        # 回调按顺序区分 reasoning / content
+        self.assertEqual(kinds, [("reasoning", "让我想想"),
+                                 ("reasoning", "用户要打招呼"),
+                                 ("content", "你好")])
+
+    def test_reasoning_split_across_chunks(self):
+        payload = reasoning_event("思考中文不能乱码") + content_event("答案") + b"data: [DONE]\n\n"
+        for size in (1, 2, 3, 5):
+            with self.subTest(chunk_size=size):
+                result = self.m._parse_sse(iter(chunk_bytes(payload, size)))
+                self.assertEqual(result.message.reasoning_content, "思考中文不能乱码")
+                self.assertEqual(result.message.content, "答案")
 
     def test_tool_calls_fragmented(self):
         # tool_call 的 name/arguments 分多个 delta 到达，需累积拼接
@@ -156,7 +188,8 @@ class ModelCallE2ETest(unittest.TestCase):
         toks = []
         with mock.patch("urllib.request.urlopen", fake_urlopen):
             res = m(messages=[{"role": "user", "content": "hi"}],
-                    tools_schema=[], on_token=toks.append)
+                    tools_schema=[],
+                    on_token=lambda t, kind: toks.append(t) if kind == "content" else None)
 
         self.assertEqual(m.model, "my-model")
         self.assertEqual(captured["url"], "https://api.deepseek.com/chat/completions")

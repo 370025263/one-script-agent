@@ -94,7 +94,7 @@ class CLIListener:
     MAX_PREVIEW_LINES = 12
 
     def __init__(self):
-        self._streaming = False
+        self._streaming = None   # None | "reasoning" | "content"
 
     def __call__(self, ev: AgentEvent):
         handler = getattr(self, f"_on_{ev.kind}", None)
@@ -103,18 +103,28 @@ class CLIListener:
 
     def _on_assistant_token(self, p):
         tok = p["token"]
-        bar = _C.paint(_C.CYAN, "│")
-        if not self._streaming:
+        kind = p.get("kind", "content")
+        if kind == "reasoning":
+            bar = _C.paint(_C.DIM, "┊")
+            color = _C.DIM
+            label = _C.paint(_C.DIM, "reasoning")
+        else:
+            bar = _C.paint(_C.CYAN, "│")
+            color = ""
             label = _C.paint(_C.BOLD + _C.CYAN, "assistant")
+        if self._streaming != kind:
+            if self._streaming is not None:
+                print()                       # 上一段（如 reasoning）收尾换行
             print(f"\n{label}")
             print(f"{bar} ", end="", flush=True)
-            self._streaming = True
-        print(tok.replace("\n", f"\n{bar} "), end="", flush=True)
+            self._streaming = kind
+        text = tok.replace("\n", f"\n{bar} ")
+        print(_C.paint(color, text) if color else text, end="", flush=True)
 
     def _on_assistant_text(self, p):
-        if self._streaming:
+        if self._streaming is not None:
             print()          # 结束流式那一行
-            self._streaming = False
+            self._streaming = None
             return
         text = (p.get("text") or "").strip()
         if not text:
@@ -513,8 +523,12 @@ class Model:
 
         手动按 \\n 缓冲分行：HTTP chunk 边界可能切在多字节 UTF-8 序列中间，
         逐行 readline 会拿到截断字节导致中文乱码，缓冲到完整行再 decode。
+
+        on_token(text, kind) 回调：kind 为 "content"（正文）或 "reasoning"
+        （推理模型的思维链 reasoning_content，如 deepseek-v4-flash）。
         """
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_map: dict[int, dict] = {}   # index → {id, name, arguments}
         finish_reason = None
         buf = b""
@@ -536,11 +550,17 @@ class Model:
                 ch = choices[0]
                 delta = ch.get("delta", {})
 
+                rtok = delta.get("reasoning_content") or ""
+                if rtok:
+                    reasoning_parts.append(rtok)
+                    if on_token:
+                        on_token(rtok, "reasoning")
+
                 tok = delta.get("content") or ""
                 if tok:
                     content_parts.append(tok)
                     if on_token:
-                        on_token(tok)
+                        on_token(tok, "content")
 
                 for tc in delta.get("tool_calls") or []:
                     idx = tc["index"]
@@ -573,7 +593,8 @@ class Model:
         return types.SimpleNamespace(
             finish_reason=finish_reason,
             message=types.SimpleNamespace(
-                content="".join(content_parts), tool_calls=tool_calls),
+                content="".join(content_parts), tool_calls=tool_calls,
+                reasoning_content="".join(reasoning_parts) or None),
         )
 
 
@@ -617,7 +638,8 @@ class Agent:
             try:
                 choice = self.model(
                     self.ctx.messages(), self.tools.schemas(),
-                    on_token=lambda tok: self.emit(AgentEvent("assistant_token", {"token": tok})),
+                    on_token=lambda tok, kind: self.emit(
+                        AgentEvent("assistant_token", {"token": tok, "kind": kind})),
                 )
             except Exception as e:
                 self.emit(AgentEvent("error", {"message": f"model failed: {e}"}))
