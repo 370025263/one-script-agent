@@ -31,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import types
 import urllib.error
@@ -391,8 +392,10 @@ class Tools:
 # ---------------------------------------------------------------------------
 # #7 ContextManager — token 预算 + tool_result 降级
 # ---------------------------------------------------------------------------
-CACHE_DIR = Path("/tmp/agent_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# 用系统临时目录而非硬编码 /tmp：Windows 原生 Python 下 /tmp 会映射成
+# C:\tmp 且未必存在；tempfile.gettempdir() 各平台都给出可写目录。
+CACHE_DIR = Path(tempfile.gettempdir()) / "agent_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ContextManager:
