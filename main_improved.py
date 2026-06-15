@@ -22,8 +22,8 @@ main_improved.py — 把上一轮批判的 8 个思路问题落地的版本。
    用 _flush_tool_results 批量写入；中间任何异常都兜底成 is_error 的 result，
    保证配对不断。
 
-仍然保持 OpenAI chat.completions 协议。没做的：streaming、memory 持久化、
-真正的 token 计数（用字符数近似）——这些是下一层的事。
+保持 OpenAI chat.completions 协议；用 urllib 替换 openai 包，零运行时依赖。
+没做的：memory 持久化、真正的 token 计数（用字符数近似）。
 """
 
 from __future__ import annotations
@@ -34,12 +34,13 @@ import os
 import subprocess
 import sys
 import time
+import types
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +93,29 @@ class CLIListener:
     MAX_PREVIEW_CHARS = 600
     MAX_PREVIEW_LINES = 12
 
+    def __init__(self):
+        self._streaming = False
+
     def __call__(self, ev: AgentEvent):
         handler = getattr(self, f"_on_{ev.kind}", None)
         if handler:
             handler(ev.payload)
 
+    def _on_assistant_token(self, p):
+        tok = p["token"]
+        bar = _C.paint(_C.CYAN, "│")
+        if not self._streaming:
+            label = _C.paint(_C.BOLD + _C.CYAN, "assistant")
+            print(f"\n{label}")
+            print(f"{bar} ", end="", flush=True)
+            self._streaming = True
+        print(tok.replace("\n", f"\n{bar} "), end="", flush=True)
+
     def _on_assistant_text(self, p):
+        if self._streaming:
+            print()          # 结束流式那一行
+            self._streaming = False
+            return
         text = (p.get("text") or "").strip()
         if not text:
             return
@@ -448,31 +466,96 @@ class ContextManager:
 
 
 # ---------------------------------------------------------------------------
-# #1 Model — 带退避重试
+# #1 Model — 带退避重试 + 流式输出（urllib 零依赖）
 # ---------------------------------------------------------------------------
 class Model:
     def __init__(self, model="deepseek-v4-flash", temperature=0.2, max_retries=5):
-        self.client = OpenAI(
-            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com"),
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        )
+        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        self.api_key = os.environ.get("OPENAI_API_KEY", "")
         self.model = model
         self.temperature = temperature
         self.max_retries = max_retries
 
-    def __call__(self, messages, tools_schema):
+    def __call__(self, messages, tools_schema, on_token=None):
         last_err = None
         for attempt in range(self.max_retries):
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.model, messages=messages,
-                    tools=tools_schema, temperature=self.temperature,
-                )
-                return resp.choices[0]
-            except (RateLimitError, APIConnectionError, APIError) as e:
+                return self._stream(messages, tools_schema, on_token)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504):
+                    last_err = e
+                    time.sleep(2 ** attempt)
+                    continue
+                body = e.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"HTTP {e.code}: {body}") from e
+            except (urllib.error.URLError, OSError) as e:
                 last_err = e
                 time.sleep(2 ** attempt)
         raise last_err
+
+    def _stream(self, messages, tools_schema, on_token):
+        body = json.dumps({
+            "model": self.model, "messages": messages,
+            "tools": tools_schema, "temperature": self.temperature,
+            "stream": True,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"},
+        )
+        content_parts: list[str] = []
+        tc_map: dict[int, dict] = {}   # index → {id, name, arguments}
+        finish_reason = None
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8").rstrip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].lstrip()
+                if data == "[DONE]":
+                    break
+                ch = json.loads(data)["choices"][0]
+                delta = ch.get("delta", {})
+
+                tok = delta.get("content") or ""
+                if tok:
+                    content_parts.append(tok)
+                    if on_token:
+                        on_token(tok)
+
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc["index"]
+                    fn = tc.get("function", {})
+                    if idx not in tc_map:
+                        tc_map[idx] = {"id": tc.get("id", ""),
+                                       "name": fn.get("name", ""), "arguments": ""}
+                    else:
+                        if tc.get("id"):
+                            tc_map[idx]["id"] = tc["id"]
+                        if fn.get("name"):
+                            tc_map[idx]["name"] = fn["name"]
+                    tc_map[idx]["arguments"] += fn.get("arguments", "")
+
+                if ch.get("finish_reason"):
+                    finish_reason = ch["finish_reason"]
+
+        tool_calls = None
+        if tc_map:
+            tool_calls = [
+                types.SimpleNamespace(
+                    id=tc_map[i]["id"],
+                    function=types.SimpleNamespace(
+                        name=tc_map[i]["name"], arguments=tc_map[i]["arguments"]),
+                )
+                for i in sorted(tc_map)
+            ]
+        return types.SimpleNamespace(
+            finish_reason=finish_reason,
+            message=types.SimpleNamespace(
+                content="".join(content_parts), tool_calls=tool_calls),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +595,10 @@ class Agent:
     def _act_loop(self):
         for turn in range(self.MAX_TURNS):
             try:
-                choice = self.model(self.ctx.messages(), self.tools.schemas())
+                choice = self.model(
+                    self.ctx.messages(), self.tools.schemas(),
+                    on_token=lambda tok: self.emit(AgentEvent("assistant_token", {"token": tok})),
+                )
             except Exception as e:
                 self.emit(AgentEvent("error", {"message": f"model failed: {e}"}))
                 return
