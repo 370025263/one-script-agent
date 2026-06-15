@@ -12,8 +12,6 @@ main_improved.py — 把上一轮批判的 8 个思路问题落地的版本。
    prompt 和 API 调用都从这里取。
 #4 并发：工具类声明 parallel_safe；调度器把可并行的同批丢 ThreadPool，不可
    并行的串行跑，保持 tool_call_id 顺序。
-#5 权限层：所有副作用工具经过 Approver.check()；策略：allow / deny /
-   ask-once / always。这是安全边界不是装饰。
 #6 CLI 解耦：Agent 只发事件（AgentEvent），CLI 是一个 listener；测试时换成
    silent listener 就行。
 #7 Context 预算：tool_result 按"距今 N 轮之外"的规则降级为文件路径+head，
@@ -37,6 +35,14 @@ import time
 import types
 import urllib.error
 import urllib.request
+
+# 仅 import 即让内置 input() 走 GNU readline：多字节感知，中文输入正常、
+# 退格按"字符"删除（而非按字节，否则删半个汉字会乱码），并附带方向键/历史。
+# 个别平台（如部分 Windows）无 readline，缺失时降级为普通 input()。
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -183,7 +189,6 @@ class ToolSpec:
     description: str
     schema: dict
     parallel_safe: bool
-    side_effect: bool                # used by approver (#5)
     func: Callable[..., str]
 
 
@@ -203,7 +208,6 @@ class ReadTool:
             "required": ["path"],
         },
         parallel_safe=True,
-        side_effect=False,
         func=None,  # set below
     )
 
@@ -232,7 +236,6 @@ class GrepTool:
             "required": ["pattern"],
         },
         parallel_safe=True,
-        side_effect=False,
         func=None,
     )
 
@@ -260,7 +263,6 @@ class ListTool:
             "required": [],
         },
         parallel_safe=True,
-        side_effect=False,
         func=None,
     )
 
@@ -280,7 +282,7 @@ ListTool.spec.func = ListTool()
 
 
 class BashTool:
-    """执行 shell 命令；有副作用，默认走 approver。"""
+    """执行 shell 命令。"""
     spec = ToolSpec(
         name="bash",
         description="Run a shell command. Returns stdout, stderr, and exit code.",
@@ -293,7 +295,6 @@ class BashTool:
             "required": ["command"],
         },
         parallel_safe=False,      # 命令之间可能有副作用依赖，串行更安全
-        side_effect=True,         # 需权限审批 (#5)
         func=None,
     )
 
@@ -335,7 +336,6 @@ class EditTool:
             "required": ["path", "old_string", "new_string"],
         },
         parallel_safe=False,         # 同文件并发会错乱
-        side_effect=True,            # 需要权限审批 (#5)
         func=None,
     )
 
@@ -386,27 +386,6 @@ class Tools:
                 "name": s.name, "description": s.description, "parameters": s.schema}}
             for s in self._specs.values()
         ]
-
-
-# ---------------------------------------------------------------------------
-# #5 Approver — 权限层
-# ---------------------------------------------------------------------------
-class Approver:
-    def __init__(self):
-        self.always: set[str] = set()
-
-    def check(self, tool_name: str, args: dict) -> bool:
-        if tool_name in self.always:
-            return True
-        q = _C.paint(_C.BOLD + _C.YELLOW, "?")
-        name = _C.paint(_C.BOLD + _C.BLUE, tool_name)
-        args_s = _C.paint(_C.DIM, json.dumps(args, ensure_ascii=False))
-        hint = _C.paint(_C.GRAY, "[y/N/a=always]")
-        ans = input(f"  {q} allow {name}({args_s}) {hint} ").strip().lower()
-        if ans == "a":
-            self.always.add(tool_name)
-            return True
-        return ans == "y"
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +594,9 @@ class Agent:
     MAX_TURNS = 60
 
     def __init__(self, tools: Tools, ctx: ContextManager, model: Model,
-                 approver: Approver, listener: Callable[[AgentEvent], None]):
-        self.tools, self.ctx, self.model, self.approver, self.emit = (
-            tools, ctx, model, approver, listener)
+                 listener: Callable[[AgentEvent], None]):
+        self.tools, self.ctx, self.model, self.emit = (
+            tools, ctx, model, listener)
         self.pool = ThreadPoolExecutor(max_workers=8)
 
     def run(self):
@@ -664,17 +643,13 @@ class Agent:
             self._run_tool_batch(msg.tool_calls)
         self.emit(AgentEvent("error", {"message": f"max_turns={self.MAX_TURNS} exceeded"}))
 
-    # #4 并发调度 + #5 审批 + #8 结果配对
+    # #4 并发调度 + #8 结果配对
     def _run_tool_batch(self, tool_calls):
         pending = []
         for tc in tool_calls:
             spec = self.tools.spec(tc.function.name)
             args = self._parse_args(tc.function.arguments)
             self.emit(AgentEvent("tool_call", {"name": spec.name, "args": args}))
-
-            if spec.side_effect and not self.approver.check(spec.name, args):
-                self._record_result(tc.id, "denied by user", is_error=True)
-                continue
             pending.append((tc, spec, args))
 
         # 可并行的先并发跑，不可并行的串行兜底
@@ -730,9 +705,8 @@ def main():
     tools.register(EditTool.spec)
     ctx = ContextManager(tools)
     model = Model()
-    approver = Approver()
     listener = CLIListener()
-    Agent(tools, ctx, model, approver, listener).run()
+    Agent(tools, ctx, model, listener).run()
 
 
 if __name__ == "__main__":
