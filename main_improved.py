@@ -510,7 +510,7 @@ class Model:
 
         with urllib.request.urlopen(req, timeout=60) as resp:
             for raw in resp:
-                line = raw.decode("utf-8").rstrip()
+                line = raw.decode("utf-8", errors="replace").rstrip()
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].lstrip()
