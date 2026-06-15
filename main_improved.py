@@ -472,7 +472,7 @@ class Model:
     def __init__(self, model="deepseek-v4-flash", temperature=0.2, max_retries=5):
         self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
         self.api_key = os.environ.get("OPENAI_API_KEY", "")
-        self.model = os.environ.get("OPENAI_MODEL", model)
+        self.model = os.environ.get("OPENAI_MODEL") or model
         self.temperature = temperature
         self.max_retries = max_retries
 
@@ -573,7 +573,8 @@ class Agent:
     def run(self):
         banner = _C.paint(_C.BOLD + _C.CYAN, "agent_learn")
         tip = _C.paint(_C.GRAY, "Ctrl-C to cancel current turn · Ctrl-D to exit")
-        print(f"\n{banner}  {tip}")
+        cfg = _C.paint(_C.GRAY, f"model={self.model.model}  url={self.model.base_url}")
+        print(f"\n{banner}  {tip}\n{cfg}")
         prompt = _C.paint(_C.BOLD + _C.CYAN, ">")
         while True:
             try:
