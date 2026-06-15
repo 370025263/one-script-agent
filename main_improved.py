@@ -655,13 +655,10 @@ class Agent:
             self.emit(AgentEvent("tool_call", {"name": spec.name, "args": args}))
             pending.append((tc, spec, args))
 
-        # 可并行的先并发跑，不可并行的串行兜底
-        parallel = [x for x in pending if x[1].parallel_safe]
-        serial = [x for x in pending if not x[1].parallel_safe]
-
+        # 可并行的丢线程池并发跑；非并行的留到收集阶段串行执行
         futures = {
             tc.id: self.pool.submit(self._safe_invoke, spec, args)
-            for tc, spec, args in parallel
+            for tc, spec, args in pending if spec.parallel_safe
         }
         for tc, spec, args in pending:  # 按原顺序收集，维护 tool_use_id 次序
             if tc.id in futures:
