@@ -509,11 +509,15 @@ class Model:
         finish_reason = None
 
         with urllib.request.urlopen(req, timeout=60) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].lstrip()
+            buf = b""
+            for chunk in iter(lambda: resp.read(4096), b""):
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r")
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].lstrip()
                 if data == "[DONE]":
                     break
                 ch = json.loads(data)["choices"][0]
