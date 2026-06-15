@@ -472,7 +472,7 @@ class Model:
     def __init__(self, model="deepseek-v4-flash", temperature=0.2, max_retries=5):
         self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
         self.api_key = os.environ.get("OPENAI_API_KEY", "")
-        self.model = model
+        self.model = os.environ.get("OPENAI_MODEL", model)
         self.temperature = temperature
         self.max_retries = max_retries
 
